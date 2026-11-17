@@ -50,15 +50,49 @@ jobs:
           echo "VER=$VER" >> $GITHUB_ENV
           mkdir -p "$GRADLE_USER_HOME"
 
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v3
+      # runner (ubuntu-24.04) 已预装 Android SDK，无需再跑 setup-android@v3。
+      # 那个 action 内部会执行 `sdkmanager "tools"`，但 runner 预装的
+      # cmdline-tools 16.0 已经把 `tools` 这个旧包名移除了，
+      # 于是报 "Warning: Failed to find package 'tools'" + exit code 1，
+      # 整条流水线当场挂掉 —— 与我们的工具链无关，纯属那个 action 过时。
+      #
+      # 这里只补装平台与 build-tools，并且全部用 `|| true` 兜底：
+      # 真正的 android.jar / aapt2 我们自带（见下一个 step），
+      # sdkmanager 只是为了让 lint / 资源处理有目录可写，失败不影响结果。
+      - name: Ensure SDK platform (best effort)
+        run: |
+          set -u
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME" 2>/dev/null || true
+          SDKMANAGER=$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")
+          echo "sdkmanager=$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          # 已预装则不重复下载；失败也放行，后面有自带的 android.jar 兜着
+          "$SDKMANAGER" "platforms;android-37" > /dev/null 2>&1 || \
+          "$SDKMANAGER" "platforms;android-36" > /dev/null 2>&1 || true
+          "$SDKMANAGER" "build-tools;36.0.0" > /dev/null 2>&1 || true
+          echo "--- platforms ---"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+          echo "--- build-tools ---"
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
 
-      - name: Accept licenses and install platform
+      - name: Place android.jar fallback
         run: |
           set -eu
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-37" "build-tools;36.0.0" > /dev/null
-        timeout-minutes: 10
+          # runner 不一定预装 android-37。仓库里带了 43MB 的 android.jar
+          # （与包 1 同源），缺平台时补一份过去，保证 AGP 有 android.jar 可读。
+          P="$ANDROID_HOME/platforms/android-37"
+          if [ ! -f "$P/android.jar" ]; then
+            echo "android-37 missing at runner, installing our own"
+            mkdir -p "$P"
+            cp toolchain/android.jar "$P/android.jar"
+            # 最小 package.xml，让 AGP 认得这是一个合法平台目录
+            printf '<ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns3="http://schemas.android.com/repository/android/generic/02"><license id="android-sdk-license" type="text">$ANDROID_SDK_LICENSE</license><localPackage path="platforms;android-37" obsolete="false"><type-details xsi:type="ns3:genericDetailsType" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/><revision><major>37</major></revision><display-name>Android SDK Platform 37</display-name></localPackage></ns2:repository>' > "$P/package.xml" 2>/dev/null || true
+          else
+            echo "android-37 already present on runner"
+          fi
+          ls -l "$P" 2>/dev/null || true
 
       - name: Fetch arm64 aapt2 override
         run: |
