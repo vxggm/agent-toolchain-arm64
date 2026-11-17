@@ -1,0 +1,153 @@
+name: build-toolchain-arm64
+
+# 自建 aarch64 Android 构建工具链（JDK17 + Gradle 9.6.0 + SDK natives）
+# 触发方式：手动 / 推送 .github/workflows 变更
+# 产物：gradle-toolchain-arm64-v<版本>.tar.gz + SHA-256
+#
+# 与 App 的关系：产物上传官网 downloads/，由「下载环境」卡片下载解压到沙箱 /opt。
+# 全程不依赖 Google SDK 包（android.jar 由 release 资产带入或本地产物）。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '工具链版本号（用于产物命名）'
+        required: false
+        default: '1.0.0'
+  push:
+    paths:
+      - '.github/workflows/toolchain-arm64.yml'
+      - 'toolchain/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          set -eux
+          VER="${{ github.event.inputs.version || '1.0.0' }}"
+          echo "VER=$VER" >> $GITHUB_ENV
+          mkdir -p "$RUNNER_TEMP/tc"
+          echo "toolchain build start: $VER"
+
+      # ---------- 1. JDK 17 aarch64 (Temurin, glibc) ----------
+      - name: Fetch JDK17 aarch64
+        run: |
+          set -eux
+          cd "$RUNNER_TEMP/tc"
+          curl -fL --retry 5 -o jdk17.tar.gz \
+            "https://api.adoptium.net/v3/binary/latest/17/ga/linux/aarch64/jdk/hotspot/normal/eclipse"
+          tar tzf jdk17.tar.gz | head -1
+
+      # ---------- 2. Gradle 9.6.0 bin ----------
+      - name: Fetch Gradle 9.6.0 and verify sha256
+        run: |
+          set -eux
+          cd "$RUNNER_TEMP/tc"
+          curl -fL --retry 5 -o gradle.zip \
+            "https://services.gradle.org/distributions/gradle-9.6.0-bin.zip"
+          EXPECT="bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01"
+          ACTUAL=$(sha256sum gradle.zip | cut -d' ' -f1)
+          echo "gradle sha256=$ACTUAL"
+          [ "$ACTUAL" = "$EXPECT" ] || { echo "SHA MISMATCH"; exit 1; }
+
+      # ---------- 3. SDK natives (aarch64 static) ----------
+      - name: Fetch aarch64 SDK build-tools
+        run: |
+          set -eux
+          cd "$RUNNER_TEMP/tc"
+          curl -fL --retry 5 -o sdk-tools.zip \
+            "https://github.com/lzhiyong/android-sdk-tools/releases/download/35.0.2/android-sdk-tools-static-aarch64.zip"
+
+      # ---------- 4. Assemble tree ----------
+      - name: Assemble toolchain tree
+        run: |
+          set -eux
+          C="$RUNNER_TEMP/tc/out/gradle-toolchain-arm64"
+          mkdir -p "$C"
+          cd "$RUNNER_TEMP/tc"
+
+          tar xzf jdk17.tar.gz -C "$C"
+          unzip -q gradle.zip -d "$C"
+          unzip -q sdk-tools.zip -d "$RUNNER_TEMP/tc/full-tools"
+
+          # 标准 SDK 布局
+          mkdir -p "$C/android-sdk/build-tools/36.0.0/lib" \
+                   "$C/android-sdk/platforms/android-37" \
+                   "$C/android-sdk/platform-tools"
+
+          F="$RUNNER_TEMP/tc/full-tools"
+          cp "$F"/build-tools/aapt2 "$F"/build-tools/zipalign "$F"/build-tools/aidl \
+             "$F"/build-tools/aapt "$F"/build-tools/dexdump "$F"/build-tools/split-select \
+             "$C/android-sdk/build-tools/36.0.0/"
+          chmod 755 "$C/android-sdk/build-tools/36.0.0/"*
+          cp "$F"/platform-tools/* "$C/android-sdk/platform-tools/"
+          chmod 755 "$C/android-sdk/platform-tools/"*
+
+          ls -l "$C/android-sdk/build-tools/36.0.0/"
+
+      # ---------- 5. android.jar（本地准备，避免直连 Google）----------
+      - name: Place android.jar
+        run: |
+          set -eux
+          C="$RUNNER_TEMP/tc/out/gradle-toolchain-arm64"
+          # 优先用仓库内 prep 目录带进来的 android.jar；没有就明确失败，不偷偷降级
+          if [ -f toolchain/android.jar ]; then
+            cp toolchain/android.jar "$C/android-sdk/platforms/android-37/android.jar"
+          else
+            echo "::error::toolchain/android.jar 缺失 —— 需从本机传一份 43MB 的 android.jar 进仓库"
+            exit 1
+          fi
+          cp toolchain/d8.jar "$C/android-sdk/build-tools/36.0.0/lib/d8.jar"
+          cp toolchain/apksigner.jar "$C/android-sdk/build-tools/36.0.0/lib/apksigner.jar"
+          ls -l "$C/android-sdk/platforms/android-37/" "$C/android-sdk/build-tools/36.0.0/lib/"
+
+      # ---------- 6. 打标记 ----------
+      - name: Stamp AgentPad markers
+        run: |
+          set -eux
+          C="$RUNNER_TEMP/tc/out/gradle-toolchain-arm64"
+          sh toolchain/stamp.sh "$C" "$VER"
+
+      # ---------- 7. 架构自检（任何非 0xB7 直接失败）----------
+      - name: Verify every binary is aarch64
+        run: |
+          set -eux
+          C="$RUNNER_TEMP/tc/out/gradle-toolchain-arm64"
+          FAIL=0
+          for f in "$C/jdk-17.0.21+9/bin/java" \
+                   "$C/gradle-9.6.0/bin/gradle" \
+                   "$C/android-sdk/build-tools/36.0.0/aapt2" \
+                   "$C/android-sdk/build-tools/36.0.0/zipalign" \
+                   "$C/android-sdk/platform-tools/adb"; do
+            [ -f "$f" ] || { echo "MISSING: $f"; FAIL=1; continue; }
+            M=$(head -c 20 "$f" | od -An -tx1 | tr -d ' \n' | cut -c35-38)
+            echo "$(basename $f) -> 0x$M"
+            [ "$M" = "00b7" ] || { echo "NOT aarch64: $f"; FAIL=1; }
+          done
+          [ "$FAIL" = "0" ] || exit 1
+
+      # ---------- 8. 打包（store，不再二次压缩）----------
+      - name: Package
+        run: |
+          set -eux
+          cd "$RUNNER_TEMP/tc/out"
+          tar cf gradle-toolchain-arm64-v"$VER".tar gradle-toolchain-arm64
+          gzip -1 gradle-toolchain-arm64-v"$VER".tar
+          ls -l gradle-toolchain-arm64-v"$VER".tar.gz
+          sha256sum gradle-toolchain-arm64-v"$VER".tar.gz | tee gradle-toolchain-arm64-v"$VER".tar.gz.sha256
+          du -sb gradle-toolchain-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-toolchain-arm64-v${{ env.VER }}
+          path: |
+            ${{ runner.temp }}/tc/out/gradle-toolchain-arm64-v*.tar.gz
+            ${{ runner.temp }}/tc/out/gradle-toolchain-arm64-v*.tar.gz.sha256
+          retention-days: 14
+          compression-level: 0
