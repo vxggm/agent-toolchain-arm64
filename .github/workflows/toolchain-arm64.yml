@@ -113,23 +113,61 @@ jobs:
           C="$RUNNER_TEMP/tc/out/gradle-toolchain-arm64"
           sh toolchain/stamp.sh "$C" "$VER"
 
-      # ---------- 7. 架构自检（任何非 0xB7 直接失败）----------
+      # ---------- 7. 架构自检 ----------
+      # 两类文件分别对待，别把启动脚本误判成架构错误：
+      #   · ELF 二进制 -> e_machine 必须是 0xB7 (aarch64)
+      #   · #! 脚本     -> 架构无关（gradle 就是个 shell 包装器）
       - name: Verify every binary is aarch64
         run: |
-          set -eux
+          set -eu
           C="$RUNNER_TEMP/tc/out/gradle-toolchain-arm64"
           FAIL=0
+          check_one() {
+            f="$1"
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; return 1; fi
+            MAGIC=$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')
+            NAME=$(basename "$f")
+            if [ "$MAGIC" = "7f454c46" ]; then
+              M=$(head -c 20 "$f" | od -An -tx1 | tr -d ' \n' | cut -c35-38)
+              if [ "$M" = "00b7" ]; then
+                echo "  ELF  aarch64  0xB7  $NAME"
+                return 0
+              else
+                echo "  ELF  WRONG    0x$M  $NAME  <-- 期望 0xB7"
+                return 1
+              fi
+            else
+              FIRST=$(head -c 2 "$f")
+              if [ "$FIRST" = "#!" ]; then
+                echo "  script        (arch-free)  $NAME"
+                return 0
+              fi
+              echo "  UNKNOWN magic=$MAGIC  $NAME"
+              return 1
+            fi
+          }
+
           for f in "$C/jdk-17.0.21+9/bin/java" \
+                   "$C/jdk-17.0.21+9/bin/javac" \
                    "$C/gradle-9.6.0/bin/gradle" \
                    "$C/android-sdk/build-tools/36.0.0/aapt2" \
+                   "$C/android-sdk/build-tools/36.0.0/aapt" \
                    "$C/android-sdk/build-tools/36.0.0/zipalign" \
-                   "$C/android-sdk/platform-tools/adb"; do
-            [ -f "$f" ] || { echo "MISSING: $f"; FAIL=1; continue; }
-            M=$(head -c 20 "$f" | od -An -tx1 | tr -d ' \n' | cut -c35-38)
-            echo "$(basename $f) -> 0x$M"
-            [ "$M" = "00b7" ] || { echo "NOT aarch64: $f"; FAIL=1; }
+                   "$C/android-sdk/build-tools/36.0.0/aidl" \
+                   "$C/android-sdk/platform-tools/adb" \
+                   "$C/android-sdk/platform-tools/fastboot"; do
+            check_one "$f" || FAIL=1
           done
-          [ "$FAIL" = "0" ] || exit 1
+
+          echo "--- jar sanity (纯 JVM，与架构无关) ---"
+          for j in "$C/android-sdk/build-tools/36.0.0/lib/d8.jar" \
+                   "$C/android-sdk/build-tools/36.0.0/lib/apksigner.jar" \
+                   "$C/android-sdk/platforms/android-37/android.jar"; do
+            [ -f "$j" ] && echo "  jar $(( $(wc -c < "$j") )) B  $(basename "$j")" || { echo "MISSING $j"; FAIL=1; }
+          done
+
+          [ "$FAIL" = "0" ] || { echo "ARCH CHECK FAILED"; exit 1; }
+          echo "ARCH CHECK PASSED"
 
       # ---------- 8. 打包（store，不再二次压缩）----------
       - name: Package
