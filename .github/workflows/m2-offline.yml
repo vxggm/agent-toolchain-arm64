@@ -94,7 +94,7 @@ jobs:
           fi
           ls -l "$P" 2>/dev/null || true
 
-      - name: Fetch arm64 aapt2 override
+      - name: Verify arm64 aapt2 availability (record only)
         run: |
           set -eux
           cd "$RUNNER_TEMP"
@@ -102,12 +102,30 @@ jobs:
             "https://github.com/lzhiyong/android-sdk-tools/releases/download/35.0.2/android-sdk-tools-static-aarch64.zip"
           unzip -q sdk-tools.zip -d sdk-tools
           AAPT2="$RUNNER_TEMP/sdk-tools/build-tools/aapt2"
-          M=$(head -c 20 "$AAPT2" | od -An -tx1 | tr -d ' \n' | cut -c35-38)
-          echo "aapt2 e_machine=0x$M (expect 00b7)"
-          [ "$M" = "00b7" ] || { echo "not aarch64, abort"; exit 1; }
-          chmod 755 "$AAPT2"
-          echo "AAPT2_ARM64=$AAPT2" >> $GITHUB_ENV
+          # 只做「形态记录」：它是 ELF 还是脚本、e_machine 是多少。
+          MAGIC=$(head -c 4 "$AAPT2" | od -An -tx1 | tr -d ' \n')
+          if [ "$MAGIC" = "7f454c46" ]; then
+            M=$(head -c 20 "$AAPT2" | od -An -tx1 | tr -d ' \n' | cut -c35-38)
+            echo "aapt2 is ELF, e_machine=0x$M (aarch64 = 00b7)"
+          else
+            echo "aapt2 is NOT an ELF (magic=$MAGIC) — 可能是脚本包装器"
+            echo "这解释了上一轮为什么在 x86_64 runner 上报 Syntax error"
+          fi
+          # 这份文件**不参与构建**，只在日志里留证。真正给手机的 arm64 aapt2
+          # 由包 1 提供，包 2 不携带任何可执行二进制。
 
+      # ⚠ 这里刻意 **不** 注入 arm64 aapt2。
+      #
+      # 上一版尝试把 arm64 aapt2 塞给 x86_64 runner，结果：
+      #   aapt2: 92: Syntax error: "(" unexpected
+      # 架构不可跨：arm64 二进制永远不能在 x86_64 上直接跑。
+      #
+      # 正确分工：
+      #   · CI 用 runner 自带的 x86_64 aapt2 完成构建 —— 目的只是把
+      #     AGP / Kotlin / Compose 的**依赖 jar** 解析下来；
+      #   · 打包前把 aapt2 从缓存里整个删掉 —— 它本来就是「按架构分发」的，
+      #     手机端由包 1 提供 arm64 版，不需要从 Maven 缓存拿。
+      # 这样包 2 是纯 JVM artifact，跨架构安全。
       - name: Warm up with a real build
         run: |
           set -eux
@@ -125,7 +143,6 @@ jobs:
           cd "${{ github.workspace }}/probe/kotlin-app"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           "$RUNNER_TEMP/gradle-9.6.0/bin/gradle" --no-daemon --stacktrace \
-            -Pandroid.aapt2FromMavenOverride="$AAPT2_ARM64" \
             assembleDebug
         timeout-minutes: 30
 
@@ -151,24 +168,31 @@ jobs:
             fi
           done
 
-      - name: Purge non-aarch64 natives
+      - name: Purge architecture-specific artifacts
         run: |
           set -eu
           CD="$GRADLE_USER_HOME/caches/modules-2/files-2.1"
-          echo "=== .so files found ==="
+          echo "=== 缓存里所有可执行/架构相关件 ==="
           find "$CD" -name '*.so' 2>/dev/null | head -20 || true
-          REMOVED=0
-          for d in "$CD"/com.android.tools.build/aapt2/*/; do
-            [ -d "$d" ] || continue
-            case "$(basename "$d")" in
-              *-linux|*-osx|*-windows)
-                echo "  purge $(basename "$d")"
-                rm -rf "$d"
-                REMOVED=$((REMOVED+1))
-                ;;
-            esac
-          done
-          echo "purged $REMOVED dirs"
+          find "$CD" -path '*aapt2*' -type f 2>/dev/null | head -20 || true
+
+          # aapt2 是 AGP 唯一的架构相关依赖：
+          #   com.android.tools.build:aapt2:<ver>-linux       → x86_64 (ELF/脚本)
+          #   com.android.tools.build:aapt2:<ver>-linux-aarch64 → arm64 (给手机用)
+          # 包 2 的作用是「依赖仓库」，而手机端的 aapt2 由包 1 提供，
+          # 所以这里把整个 aapt2 分组删干净 —— 避免把 x86_64 带给手机，
+          # 也避免用户误以为包 2 里那个能跑。
+          #
+          # 注意：删掉它不影响用户构建，因为 AGP 会用
+          # -Pandroid.aapt2FromMavenOverride 指向包 1 的 arm64 aapt2。
+          if [ -d "$CD/com.android.tools.build/aapt2" ]; then
+            echo "=== 删除 aapt2 分组（架构相关，由包 1 提供）==="
+            du -sb "$CD/com.android.tools.build/aapt2" || true
+            rm -rf "$CD/com.android.tools.build/aapt2"
+          fi
+          echo "=== 清理后确认 ==="
+          find "$CD" -name '*.so' 2>/dev/null | head -10 || true
+          echo "remaining aapt2 dirs: $(find "$CD" -path '*aapt2*' -type d 2>/dev/null | wc -l)"
 
       - name: Stamp
         run: |

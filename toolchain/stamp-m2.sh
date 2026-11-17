@@ -68,12 +68,20 @@ for p in \
     FAIL=1
   fi
 done
-echo "== aapt2 architecture (必须全是 0xB7) =="
-find "$C/caches" -name 'aapt2*' -type f 2>/dev/null | while read -r f; do
-  case "$f" in *.jar) continue;; esac
-  m=$(head -c 20 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n' | cut -c35-38)
-  [ -n "$m" ] && echo "  0x$m  $(echo "$f" | sed "s|$C/||")"
-done
+
+echo "== 架构纯净性（包 2 不应含任何 aapt2 二进制）=="
+# aapt2 是按架构分发的，x86_64 版在手机上跑不了；
+# 手机端由包 1 提供 arm64 版，所以这里必须为空。
+A2=$(find "$C/caches" -path '*com.android.tools.build/aapt2*' -type f 2>/dev/null | wc -l)
+if [ "$A2" = "0" ]; then
+  echo "  OK   aapt2 已剔除（由包 1 提供 arm64 版）"
+else
+  echo "  WARN 仍有 $A2 个 aapt2 文件（可能是别的 classifier，检查是否 x86_64）"
+  find "$C/caches" -path '*com.android.tools.build/aapt2*' -type f 2>/dev/null | head -5
+fi
+# 其他 .so 也不该有
+SO=$(find "$C/caches" -name '*.so' 2>/dev/null | wc -l)
+echo "  .so 文件数: $SO（预期 0）"
 echo "== size =="
 du -sb "$C/caches" 2>/dev/null || du -sb "$C"
 [ "$FAIL" = "0" ] && echo "VERIFY PASSED" || echo "VERIFY FAILED"
