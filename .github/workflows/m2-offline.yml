@@ -2,17 +2,18 @@ name: build-m2-offline
 
 # 包 2：Gradle 离线 Maven 仓库（AGP + Kotlin 插件 + Compose 依赖）
 #
-# 产出 gradle-m2-offline-v<版本>.tar.gz，解压后是一个可直接挂给
-# Gradle 的 GRADLE_USER_HOME 片段（caches/modules-2 + wrapper 信息）。
+# 产出 gradle-m2-offline-v<ver>.tar.gz，解压使 caches/ 落到 GRADLE_USER_HOME，
+# 再配 -Pandroid.aapt2FromMavenOverride 指向包 1 的 arm64 aapt2，即可离线编 KT。
 #
-# 与包 1 的关系：
-#   包 1 gradle-toolchain-arm64 = JDK + Gradle + SDK 原生件（能编纯 Java）
-#   包 2 gradle-m2-offline      = 依赖仓库（补上 AGP/Kotlin/Compose，能编 KT）
-#   两个包解压到同一处、包 2 叠加即可，不必重下包 1。
+# 包 1 = JDK + Gradle + SDK 原生件（能编纯 Java）
+# 包 2 = 依赖仓库（补 AGP/Kotlin/Compose，能编 Kotlin/Compose）
 #
-# 关键设计：这里必须用「真工程」跑一次 BUILD SUCCESSFUL。
-#   不跑构建的话，Gradle 不会解析传递依赖，缓存里只有插件元数据没有实际 jar，
-#   用户拿到照样编不了。
+# 关键：必须用「真工程」跑一次 assembleDebug。
+# 空跑不解析传递依赖，缓存里没有实际 jar，用户拿到照旧编不了。
+#
+# ⚠ 所有多行文本（banner / mark.env / verify.sh）都放在 toolchain/stamp-m2.sh
+#   里，绝不内联到 run: | 的 heredoc —— YAML 块标量遇零缩进行会当场终止，
+#   导致整个 workflow 解析失败（表现为 jobs=0、run 名显示成文件路径）。
 on:
   workflow_dispatch:
     inputs:
@@ -24,14 +25,13 @@ on:
     paths:
       - '.github/workflows/m2-offline.yml'
       - 'probe/kotlin-app/**'
-      - 'toolchain/**'
+      - 'toolchain/stamp-m2.sh'
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      # 所有 Gradle 缓存都收到这里，最后整包打包
       GRADLE_USER_HOME: ${{ github.workspace }}/.gh-gradle
     steps:
       - name: Checkout
@@ -49,23 +49,18 @@ jobs:
           VER="${{ github.event.inputs.version || '1.0.0' }}"
           echo "VER=$VER" >> $GITHUB_ENV
           mkdir -p "$GRADLE_USER_HOME"
-          echo "GRADLE_USER_HOME=$GRADLE_USER_HOME"
 
-      - name: Install Android SDK (x86_64 runner, 仅用于跑构建)
+      - name: Install Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Accept licenses
+      - name: Accept licenses and install platform
         run: |
           set -eu
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platforms;android-37" "build-tools;36.0.0" > /dev/null
         timeout-minutes: 10
 
-      # ---------- 关键：aapt2 必须是 arm64 ----------
-      # runner 是 x86_64，AGP 默认会下载 linux x86_64 的 aapt2 并塞进缓存。
-      # 那个文件到了手机上是 "cannot execute: required file not found"。
-      # 所以先用包 1 里的 arm64 aapt2 覆盖掉，让构建过程用的就是手机能跑的那份。
-      - name: Fetch arm64 aapt2 and override
+      - name: Fetch arm64 aapt2 override
         run: |
           set -eux
           cd "$RUNNER_TEMP"
@@ -74,18 +69,14 @@ jobs:
           unzip -q sdk-tools.zip -d sdk-tools
           AAPT2="$RUNNER_TEMP/sdk-tools/build-tools/aapt2"
           M=$(head -c 20 "$AAPT2" | od -An -tx1 | tr -d ' \n' | cut -c35-38)
-          echo "aapt2 e_machine=0x$M (期望 00b7)"
-          [ "$M" = "00b7" ] || { echo "aapt2 不是 aarch64，拒绝继续"; exit 1; }
-          echo "AAPT2_ARM64=$AAPT2" >> $GITHUB_ENV
+          echo "aapt2 e_machine=0x$M (expect 00b7)"
+          [ "$M" = "00b7" ] || { echo "not aarch64, abort"; exit 1; }
           chmod 755 "$AAPT2"
+          echo "AAPT2_ARM64=$AAPT2" >> $GITHUB_ENV
 
-      # ---------- 真跑一次构建（这一步才是真正的价值）----------
       - name: Warm up with a real build
         run: |
           set -eux
-          # 宿主机上没有 Gradle 9.6.0（runner 预装的是 8.x），
-          # 而包 1 里带的正是 9.6.0 —— 必须用同一个版本预热，
-          # 否则缓存里的 Gradle 内部 artifact 版本对不上，用户那边会重新解析。
           cd "$RUNNER_TEMP"
           curl -fL --retry 5 -o gradle.zip \
             "https://services.gradle.org/distributions/gradle-9.6.0-bin.zip"
@@ -104,12 +95,13 @@ jobs:
             assembleDebug
         timeout-minutes: 30
 
-      - name: Record what got resolved
+      - name: Report resolved artifacts
         run: |
           set -eu
-          echo "=== modules-2 体积 ==="
+          CD="$GRADLE_USER_HOME/caches/modules-2/files-2.1"
+          echo "=== modules-2 size ==="
           du -sb "$GRADLE_USER_HOME/caches/modules-2" || true
-          echo "=== 关键 asset 是否真的落了盘 ==="
+          echo "=== key artifacts ==="
           for pat in \
             'com.android.tools.build/gradle/9.4.0' \
             'com.android.tools.build/aapt2' \
@@ -118,94 +110,41 @@ jobs:
             'androidx.compose.material3' \
             'androidx.compose.runtime' \
             'androidx.compose.ui'; do
-            if find "$GRADLE_USER_HOME/caches/modules-2/files-2.1" -path "*$pat*" -type f | head -1 | grep -q .; then
+            if find "$CD" -path "*$pat*" -type f | head -1 | grep -q .; then
               echo "  OK   $pat"
             else
               echo "  MISS $pat"
             fi
           done
 
-      # ---------- 剔除架构相关件，避免把 x86_64 带给手机 ----------
       - name: Purge non-aarch64 natives
         run: |
           set -eu
           CD="$GRADLE_USER_HOME/caches/modules-2/files-2.1"
-          echo "=== 查找可能带 .so 的 artifact ==="
+          echo "=== .so files found ==="
           find "$CD" -name '*.so' 2>/dev/null | head -20 || true
-          # aapt2 的 linux 分类器包同时含 x86_64 与 aarch64；我们只保留 aarch64。
-          # 目录结构：com.android.tools.build/aapt2/<ver>-<classifier>/
           REMOVED=0
           for d in "$CD"/com.android.tools.build/aapt2/*/; do
             [ -d "$d" ] || continue
             case "$(basename "$d")" in
-              *-linux)  # 通用 linux 分类器（通常 x86_64）
-                echo "  purge $(basename $d)"; rm -rf "$d"; REMOVED=$((REMOVED+1));;
-              *-osx|*-windows)
-                echo "  purge $(basename $d)"; rm -rf "$d"; REMOVED=$((REMOVED+1));;
+              *-linux|*-osx|*-windows)
+                echo "  purge $(basename "$d")"
+                rm -rf "$d"
+                REMOVED=$((REMOVED+1))
+                ;;
             esac
           done
           echo "purged $REMOVED dirs"
 
-      # ---------- 打标记 ----------
       - name: Stamp
         run: |
           set -eu
           C="$RUNNER_TEMP/out/gradle-m2-offline"
           mkdir -p "$C"
           cp -a "$GRADLE_USER_HOME/caches" "$C/"
-          mkdir -p "$C/.agentpad"
-          cat > "$C/AGENTPAD-M2-OFFLINE.txt" <<EOF
-==============================================================
- AGENTPAD WORKSPACE - GRADLE OFFLINE MAVEN REPOSITORY
-==============================================================
- name    : gradle-m2-offline
- version : $VER
- built   : $(date -u +%Y-%m-%d)
- host    : AgentPad Workspace  (com.agentpad.workspace)
- origin  : produced by a REAL assembleDebug run on CI,
-           NOT a hand-assembled jar list
---------------------------------------------------------------
- contents:
-   AGP 9.4.0 + aapt2 (arm64 override)
-   org.jetbrains.kotlin.plugin.compose 2.4.21
-   compose-bom 2026.09.00 / material3 1.5.0-beta02
-   androidx core / activity / lifecycle
---------------------------------------------------------------
- usage: extract so that "caches/" lands inside GRADLE_USER_HOME,
-        then run gradle with --offline
- verify: sh verify.sh
-==============================================================
-EOF
-          cat > "$C/.agentpad/mark.env" <<EOF
-AGENTPAD_M2=1
-AGENTPAD_APP=com.agentpad.workspace
-AGENTPAD_NAME=gradle-m2-offline
-AGENTPAD_VERSION=$VER
-AGENTPAD_BUILD_DATE=$(date -u +%Y-%m-%d)
-EOF
-          cat > "$C/verify.sh" <<'EOF'
-#!/bin/sh
-C=$(cd "$(dirname "$0")" && pwd)
-echo "== agentpad marker =="
-cat "$C/.agentpad/mark.env" 2>/dev/null || echo "MARKER MISSING"
-echo "== key artifacts =="
-for p in \
-  'com.android.tools.build/gradle/9.4.0' \
-  'org.jetbrains.kotlin/kotlin-gradle-plugin' \
-  'androidx.compose.material3'; do
-  if find "$C/caches" -path "*$p*" -type f 2>/dev/null | head -1 | grep -q .; then
-    echo "  OK   $p"
-  else
-    echo "  MISS $p"
-  fi
-done
-echo "== size =="
-du -sb "$C/caches" 2>/dev/null || du -sb "$C"
-EOF
-          chmod 755 "$C/verify.sh"
+          sh toolchain/stamp-m2.sh "$C" "$VER"
           du -sb "$C"
 
-      # ---------- 打包（store，不二次压缩）----------
       - name: Package
         run: |
           set -eu
