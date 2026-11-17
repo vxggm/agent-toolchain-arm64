@@ -221,3 +221,39 @@ jobs:
             ${{ runner.temp }}/out/gradle-m2-offline-v*.tar.gz.sha256
           retention-days: 14
           compression-level: 0
+
+      # ---------- 发版：与包 1 同一个 Release，一次给用户两件 ----------
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: toolchain-v${{ env.VER }}
+          name: Gradle aarch64 Toolchain v${{ env.VER }}
+          body: |
+            AgentPad 自建 aarch64 Android 构建工具链（两包制）
+
+            ## 包 1 · gradle-toolchain-arm64
+            JDK 17.0.21+9 + Gradle 9.6.0 + build-tools 36.0.0(aarch64 原生)
+            + platforms/android-37 + platform-tools
+            → **能编纯 Java Android 工程**
+
+            ## 包 2 · gradle-m2-offline
+            Gradle 离线依赖仓库：AGP 9.4.0 + Kotlin 2.4.21 插件
+            + Compose BOM 2026.09.00 + androidx 全链
+            → 叠加包 1 后 **能编 Kotlin / Compose 工程**
+
+            ### 用法
+            1. 两个包都解压，包 2 的 `caches/` 放进包 1 的 `GRADLE_USER_HOME`
+            2. `-Pandroid.aapt2FromMavenOverride` 指向包 1 的 arm64 aapt2
+            3. `gradle --offline assembleDebug`
+
+            包 2 不含任何可执行二进制（aapt2 已剔除，由包 1 提供），
+            因此两包可跨架构安全分发。
+
+            解压后先跑 `sh verify.sh` 自检。
+          files: |
+            ${{ runner.temp }}/out/gradle-m2-offline-v*.tar.gz
+            ${{ runner.temp }}/out/gradle-m2-offline-v*.tar.gz.sha256
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

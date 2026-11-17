@@ -189,3 +189,31 @@ jobs:
             ${{ runner.temp }}/tc/out/gradle-toolchain-arm64-v*.tar.gz.sha256
           retention-days: 14
           compression-level: 0
+
+      # ---------- 发版：Release 里只放 tar.gz（不再套 zip）----------
+      # App 端拿到的就是这一层的 tar.gz，配加速前缀可直接下载：
+      #   https://mirror.mikus.ink/https://github.com/<repo>/releases/download/<tag>/<file>
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: toolchain-v${{ env.VER }}
+          name: Gradle aarch64 Toolchain v${{ env.VER }}
+          body: |
+            AgentPad 自建 aarch64 Android 构建工具链 · 包 1
+
+            - JDK 17.0.21+9 (Temurin, linux/aarch64, glibc)
+            - Gradle 9.6.0 (bin, sha256 校验通过)
+            - build-tools 36.0.0 aarch64 原生 (aapt2/zipalign/aidl/aapt/dexdump/split-select)
+            - platforms/android-37 android.jar
+            - platform-tools aarch64
+
+            全部可执行为原生 ELF aarch64 (e_machine=0xB7)，无需 qemu。
+
+            解压后先跑 `sh verify.sh` 自检。
+          files: |
+            ${{ runner.temp }}/tc/out/gradle-toolchain-arm64-v*.tar.gz
+            ${{ runner.temp }}/tc/out/gradle-toolchain-arm64-v*.tar.gz.sha256
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
