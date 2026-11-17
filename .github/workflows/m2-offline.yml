@@ -27,6 +27,10 @@ on:
       - 'probe/kotlin-app/**'
       - 'toolchain/stamp-m2.sh'
 
+# 与包 1 同一个 Release，需要 contents: write
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04

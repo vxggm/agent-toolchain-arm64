@@ -18,6 +18,12 @@ on:
       - '.github/workflows/toolchain-arm64.yml'
       - 'toolchain/**'
 
+# softprops/action-gh-release 创建 Release + 上传 asset 需要 contents: write。
+# 缺这条会报 403 "Resource not accessible by integration"，
+# 而且构建本身是成功的 —— 只有发布那一步挂，很容易误判成构建失败。
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
